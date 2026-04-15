@@ -46,4 +46,3 @@ npm run dev
 - SQLite：`data/app.db`
 - 上传文件：`data/uploads/`
 - 向量库（Chroma）：`data/chroma/`
-
