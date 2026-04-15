@@ -1,0 +1,4 @@
+# Vector store (installed when enabling RAG)
+# Note: chromadb pulls many deps on Windows; keep isolated from core requirements.
+chromadb>=1.0.0
+
