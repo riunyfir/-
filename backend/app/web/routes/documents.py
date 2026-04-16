@@ -1,43 +1,25 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from uuid import uuid4
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlmodel import Session, col, select
 
 from ...agents.mindmap import to_outline_md
-from ...agents.summarizer import summarize
-from ...agents.tagger import tag_document
 from ...agents.qna import answer_question
 from ...db import get_session
-from ...ingest.chunker import chunk_text
-from ...ingest.doc_reader import read_text_from_path
-from ...models import (
-    ChatMessage,
-    ChatSession,
-    Chunk,
-    Document,
-    DocumentTag,
-    DocumentText,
-    Summary,
-    Tag,
+from ...models import BackgroundJob, ChatMessage, ChatSession, Document, DocumentText, Summary
+from ...pipeline.document_ops import (
+    process_document_core,
+    summarize_document_core,
+    tag_document_core,
 )
-from ...settings import settings
-from ...rag.indexer import index_document_chunks
+from ...services.job_runner import run_background_job
 from ..schemas import ChatRequest, ChatResponse
 
 router = APIRouter()
-
-
-def _find_uploaded_file(document_id: UUID) -> Path | None:
-    uploads_dir = settings.resolved_uploads_dir()
-    if not uploads_dir.exists():
-        return None
-    matches = list(uploads_dir.glob(f"{document_id}__*"))
-    return matches[0] if matches else None
 
 
 @router.get("/documents")
@@ -73,143 +55,115 @@ def get_document(document_id: UUID, session: Session = Depends(get_session)):
     }
 
 
-@router.post("/documents/{document_id}/process")
-def process_document(document_id: UUID, session: Session = Depends(get_session)):
+@router.get("/documents/{document_id}/jobs")
+def list_document_jobs(document_id: UUID, session: Session = Depends(get_session), limit: int = 30):
     doc = session.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    rows = session.exec(
+        select(BackgroundJob)
+        .where(BackgroundJob.document_id == document_id)
+        .order_by(col(BackgroundJob.created_at).desc())
+    ).all()
+    return [
+        {
+            "id": str(j.id),
+            "job_type": j.job_type,
+            "status": j.status,
+            "progress": j.progress,
+            "message": j.message,
+            "created_at": j.created_at.isoformat(),
+        }
+        for j in rows[:limit]
+    ]
 
-    uploaded = _find_uploaded_file(document_id)
-    if not uploaded:
-        raise HTTPException(status_code=404, detail="uploaded file missing on disk")
 
-    try:
-        text = read_text_from_path(uploaded)
-    except ValueError as e:
-        doc.status = "failed"
-        session.add(doc)
-        session.commit()
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        doc.status = "failed"
-        session.add(doc)
-        session.commit()
-        raise
+@router.post("/documents/{document_id}/process")
+def process_document(document_id: UUID, session: Session = Depends(get_session)):
+    return process_document_core(session, document_id)
 
-    if not text.strip():
-        doc.status = "failed"
-        session.add(doc)
-        session.commit()
-        raise HTTPException(status_code=400, detail="no extractable text")
 
-    # Upsert document text
-    existing_text = session.get(DocumentText, document_id)
-    if existing_text:
-        existing_text.full_text = text
-        session.add(existing_text)
-    else:
-        session.add(DocumentText(document_id=document_id, full_text=text))
-
-    # Replace chunks for idempotency
-    old_chunks = session.exec(select(Chunk).where(Chunk.document_id == document_id)).all()
-    for ch in old_chunks:
-        session.delete(ch)
+@router.post("/documents/{document_id}/process-async")
+def process_document_async(
+    document_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
+    doc = session.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document not found")
+    job = BackgroundJob(
+        job_type="process",
+        document_id=document_id,
+        status="pending",
+        progress=0,
+        message="排队中…",
+    )
+    session.add(job)
     session.commit()
-
-    chunks = chunk_text(text)
-    for i, ch in enumerate(chunks):
-        session.add(
-            Chunk(
-                document_id=document_id,
-                chunk_index=i,
-                content=ch.content,
-                start_char=ch.start_char,
-                end_char=ch.end_char,
-            )
-        )
-
-    doc.text_chars = len(text)
-    doc.status = "parsed"
-    session.add(doc)
-    session.commit()
-
-    # Best-effort vector indexing (requires chromadb installed + ollama running)
-    indexed = 0
-    indexing_error: str | None = None
-    try:
-        indexed = index_document_chunks(session=session, document_id=document_id)
-        if indexed:
-            doc.status = "indexed"
-            session.add(doc)
-            session.commit()
-    except ModuleNotFoundError:
-        # chromadb not installed yet
-        indexing_error = "chromadb not installed"
-    except Exception as e:
-        # indexing failure should not block parsing for MVP, but should be visible to caller
-        indexing_error = f"{type(e).__name__}: {e}"
-
-    return {
-        "document_id": str(document_id),
-        "chunks": len(chunks),
-        "indexed": indexed,
-        "indexing_error": indexing_error,
-        "status": doc.status,
-    }
+    session.refresh(job)
+    background_tasks.add_task(run_background_job, job.id)
+    return {"job_id": str(job.id), "status": job.status, "message": job.message}
 
 
 @router.post("/documents/{document_id}/summarize")
 def summarize_document(document_id: UUID, session: Session = Depends(get_session)):
+    return summarize_document_core(session, document_id)
+
+
+@router.post("/documents/{document_id}/summarize-async")
+def summarize_document_async(
+    document_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
     doc = session.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
-    text = session.get(DocumentText, document_id)
-    if not text:
+    if not session.get(DocumentText, document_id):
         raise HTTPException(status_code=400, detail="document not processed yet")
-
-    out = summarize(text.full_text[:20000])  # keep latency bounded for MVP
-    row = Summary(
+    job = BackgroundJob(
+        job_type="summarize",
         document_id=document_id,
-        short_summary=out.short_summary,
-        bullets_json=json.dumps(out.bullets, ensure_ascii=False),
-        outline_md=out.outline_md,
+        status="pending",
+        progress=0,
+        message="排队中…",
     )
-    session.merge(row)
+    session.add(job)
     session.commit()
-    return out.model_dump()
+    session.refresh(job)
+    background_tasks.add_task(run_background_job, job.id)
+    return {"job_id": str(job.id), "status": job.status, "message": job.message}
 
 
 @router.post("/documents/{document_id}/tag")
 def tag_doc(document_id: UUID, session: Session = Depends(get_session)):
+    return tag_document_core(session, document_id)
+
+
+@router.post("/documents/{document_id}/tag-async")
+def tag_doc_async(
+    document_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
     doc = session.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
-    text = session.get(DocumentText, document_id)
-    if not text:
+    if not session.get(DocumentText, document_id):
         raise HTTPException(status_code=400, detail="document not processed yet")
-
-    out = tag_document(text.full_text[:20000])
-    # upsert tags + mapping
-    # delete existing mappings
-    existing = session.exec(select(DocumentTag).where(DocumentTag.document_id == document_id)).all()
-    for r in existing:
-        session.delete(r)
+    job = BackgroundJob(
+        job_type="tag",
+        document_id=document_id,
+        status="pending",
+        progress=0,
+        message="排队中…",
+    )
+    session.add(job)
     session.commit()
-
-    created: list[dict] = []
-    for t in out.tags:
-        tag_row = session.exec(select(Tag).where(Tag.name == t.name)).first()
-        if not tag_row:
-            tag_row = Tag(name=t.name)
-            session.add(tag_row)
-            session.commit()
-            session.refresh(tag_row)
-
-        session.add(DocumentTag(document_id=document_id, tag_id=tag_row.id, score=float(t.score)))
-        created.append({"id": str(tag_row.id), "name": tag_row.name, "score": float(t.score)})
-
-    session.commit()
-    return {"document_id": str(document_id), "tags": created}
+    session.refresh(job)
+    background_tasks.add_task(run_background_job, job.id)
+    return {"job_id": str(job.id), "status": job.status, "message": job.message}
 
 
 @router.get("/documents/{document_id}/mindmap")
@@ -233,7 +187,6 @@ def chat_api(body: ChatRequest, session: Session = Depends(get_session)):
 
     out = answer_question(body.question, session=session, document_id=doc_id, tag=tag)
 
-    # Session persistence (SQLite)
     sess_id: UUID
     if body.session_id:
         try:
@@ -265,4 +218,3 @@ def chat_api(body: ChatRequest, session: Session = Depends(get_session)):
     session.commit()
 
     return ChatResponse(answer=out.answer, citations=citations, session_id=str(sess.id))
-

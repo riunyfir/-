@@ -72,6 +72,21 @@ class ChatSession(SQLModel, table=True):
     title: str = "New Chat"
 
 
+class BackgroundJob(SQLModel, table=True):
+    __tablename__ = "background_jobs"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
+    job_type: str = Field(index=True)  # process | summarize | tag
+    document_id: UUID = Field(index=True, foreign_key="documents.id")
+    status: str = "pending"  # pending | running | succeeded | failed
+    progress: int = 0  # 0-100
+    message: str = ""
+    result_json: str = "{}"
+    error: str = ""
+    created_at: dt.datetime = Field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+    updated_at: dt.datetime = Field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+
+
 class ChatMessage(SQLModel, table=True):
     __tablename__ = "chat_messages"
 

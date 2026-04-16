@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlmodel import Session, select
 
 from ..llm.ollama_client import embed_texts
-from ..models import Chunk
+from ..models import Chunk, Document
 from .chroma_store import get_chroma_collection
 
 
@@ -21,6 +21,9 @@ def index_document_chunks(session: Session, document_id: UUID, batch_size: int =
     ).all()
     if not chunks:
         return 0
+
+    doc_row = session.get(Document, document_id)
+    filename = doc_row.filename if doc_row else ""
 
     col = get_chroma_collection()
 
@@ -43,6 +46,7 @@ def index_document_chunks(session: Session, document_id: UUID, batch_size: int =
                 "document_id": str(c.document_id),
                 "chunk_id": str(c.id),
                 "chunk_index": int(c.chunk_index),
+                "filename": filename or "unknown",
             }
             for c in batch
         ]

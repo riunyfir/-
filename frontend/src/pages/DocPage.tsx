@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { Mindmap } from '../components/Mindmap'
-import { getMindmap, summarizeDocument, tagDocument } from '../lib/api'
+import { getMindmap, pollJob, summarizeDocumentAsync, tagDocumentAsync, type JobStatus } from '../lib/api'
 
 export function DocPage() {
   const { id } = useParams()
@@ -11,6 +11,7 @@ export function DocPage() {
   const [outline, setOutline] = useState<string>('# 加载中…')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const [progress, setProgress] = useState<{ pct: number; msg: string } | null>(null)
 
   useEffect(() => {
     if (!docId) return
@@ -25,18 +26,29 @@ export function DocPage() {
     })()
   }, [docId])
 
+  function onJobProgress(j: JobStatus) {
+    setProgress({ pct: j.progress, msg: j.message })
+  }
+
   async function doSummarize() {
     if (!docId) return
     setBusy(true)
     setErr(null)
+    setProgress({ pct: 0, msg: '排队中…' })
     try {
-      const s = await summarizeDocument(docId)
-      setSummary(s)
-      if (s?.outline_md) setOutline(s.outline_md)
+      const { job_id } = await summarizeDocumentAsync(docId)
+      const done = await pollJob(job_id, onJobProgress)
+      if (done.status === 'failed') {
+        throw new Error(done.error || '总结失败')
+      }
+      const res = done.result as any
+      setSummary(res)
+      if (res?.outline_md) setOutline(res.outline_md)
     } catch (e: any) {
       setErr(e?.message ?? String(e))
     } finally {
       setBusy(false)
+      setProgress(null)
     }
   }
 
@@ -44,12 +56,19 @@ export function DocPage() {
     if (!docId) return
     setBusy(true)
     setErr(null)
+    setProgress({ pct: 0, msg: '排队中…' })
     try {
-      setTags(await tagDocument(docId))
+      const { job_id } = await tagDocumentAsync(docId)
+      const done = await pollJob(job_id, onJobProgress)
+      if (done.status === 'failed') {
+        throw new Error(done.error || '打标签失败')
+      }
+      setTags(done.result)
     } catch (e: any) {
       setErr(e?.message ?? String(e))
     } finally {
       setBusy(false)
+      setProgress(null)
     }
   }
 
@@ -76,13 +95,28 @@ export function DocPage() {
           </div>
         </div>
 
+        {progress && (
+          <div className="mt-4">
+            <div className="mb-1 flex justify-between text-xs text-slate-600">
+              <span>{progress.msg}</span>
+              <span>{progress.pct}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
+              <div
+                className="h-full rounded-full bg-indigo-500 transition-all duration-300"
+                style={{ width: `${Math.min(100, Math.max(0, progress.pct))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         {err && <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
 
         {summary && (
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <div className="rounded-lg border bg-slate-50 p-3">
               <div className="text-sm font-semibold">摘要</div>
-              <div className="mt-2 text-sm text-slate-700 whitespace-pre-wrap">{summary.short_summary}</div>
+              <div className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{summary.short_summary}</div>
             </div>
             <div className="rounded-lg border bg-slate-50 p-3">
               <div className="text-sm font-semibold">要点</div>
@@ -100,7 +134,10 @@ export function DocPage() {
             <div className="text-sm font-semibold">标签</div>
             <div className="mt-2 flex flex-wrap gap-2">
               {tags.tags.map((t: any) => (
-                <span key={t.id ?? t.name} className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                <span
+                  key={t.id ?? t.name}
+                  className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700"
+                >
                   {t.name}
                 </span>
               ))}
@@ -119,4 +156,3 @@ export function DocPage() {
     </div>
   )
 }
-
